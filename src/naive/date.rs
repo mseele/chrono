@@ -5,7 +5,8 @@
 
 #[cfg(any(feature = "alloc", feature = "std", test))]
 use core::borrow::Borrow;
-use core::convert::TryFrom;
+use core::convert::{TryFrom, TryInto};
+use core::hash::{Hash, Hasher};
 use core::ops::{Add, AddAssign, RangeInclusive, Sub, SubAssign};
 use core::{fmt, str};
 
@@ -77,7 +78,7 @@ impl NaiveWeek {
         let start = self.start.num_days_from_monday();
         let end = self.date.weekday().num_days_from_monday();
         let days = if start > end { 7 - start + end } else { end - start };
-        self.date - Duration::days(days.into())
+        self.date - Days::from_u32(days)
     }
 
     /// Returns a date representing the last day of the week.
@@ -93,7 +94,7 @@ impl NaiveWeek {
     /// ```
     #[inline]
     pub fn last_day(&self) -> NaiveDate {
-        self.first_day() + Duration::days(6)
+        self.first_day() + Days::from_u32(6)
     }
 
     /// Returns a [`RangeInclusive<T>`] representing the whole week bounded by
@@ -121,14 +122,103 @@ impl NaiveWeek {
 /// This is useful becuase when using `Duration` it is possible
 /// that adding `Duration::days(1)` doesn't increment the day value as expected due to it being a
 /// fixed number of seconds. This difference applies only when dealing with `DateTime<TimeZone>` data types
-/// and in other cases `Duration::days(n)` and `Days::new(n)` are equivalent.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, PartialOrd)]
-pub struct Days(pub(crate) u64);
+/// and in other cases `Duration::days(n)` and `Days::from_u32(n)` are equivalent.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, PartialOrd, Ord)]
+pub struct Days(pub(crate) u32);
 
 impl Days {
-    /// Construct a new `Days` from a number of months
+    /// Construct a new `Days` from a number of days
+    #[deprecated(since = "0.4.23", note = "Use Days::from_u32 instead")]
     pub fn new(num: u64) -> Self {
+        Self(u32::try_from(num).unwrap())
+    }
+
+    /// Construct a new `Days` from a number of days
+    pub fn from_u32(num: u32) -> Self {
         Self(num)
+    }
+}
+
+/// A difference in a number of days, either forwards or backwards.
+///
+/// This type is often returned from fuctions but is generally not used as a parameter.
+/// Instead the inner `Days` must first be extracted and then used. There are helper methods
+/// which can assist with this.
+#[derive(Clone, Copy, Debug, PartialOrd, Ord)]
+pub enum DaysDelta {
+    /// the forwards direction
+    Forwards(Days),
+    /// the backwards direction
+    Backwards(Days),
+}
+
+impl DaysDelta {
+    /// Assert that the direction is forwards and throw away the `Days` otherwise.
+    pub fn forwards(self) -> Option<Days> {
+        match self {
+            DaysDelta::Forwards(d) => Some(d),
+            DaysDelta::Backwards(_) => None,
+        }
+    }
+
+    /// Assert that the direction is backwards and throw away the `Days` otherwise.
+    pub fn backwards(self) -> Option<Days> {
+        match self {
+            DaysDelta::Forwards(_) => None,
+            DaysDelta::Backwards(d) => Some(d),
+        }
+    }
+
+    /// Get the contained `Days`, no matter which direction
+    pub fn abs(self) -> Days {
+        match self {
+            DaysDelta::Backwards(d) => d,
+            DaysDelta::Forwards(d) => d,
+        }
+    }
+}
+
+impl Hash for DaysDelta {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // the `Hash` impl must match the `PartialEq` impl
+        // in that when the Days is 0, forwards and backwards are
+        // equal and have the same hash.
+        // otherwise, we have to hash something extra to account
+        // for whether the delta is forwards or backwards.
+        match self {
+            DaysDelta::Forwards(d) | DaysDelta::Backwards(d) if *d == Days::from_u32(0) => {
+                Days::from_u32(0).hash(state)
+            }
+            DaysDelta::Forwards(d) => {
+                d.hash(state);
+                "Forwards".hash(state);
+            }
+            DaysDelta::Backwards(d) => {
+                d.hash(state);
+                "Backwards".hash(state);
+            }
+        }
+    }
+}
+
+impl PartialEq for DaysDelta {
+    fn eq(&self, other: &DaysDelta) -> bool {
+        match (self, other) {
+            (DaysDelta::Forwards(f1), DaysDelta::Forwards(f2)) => f1 == f2,
+            (DaysDelta::Backwards(b1), DaysDelta::Backwards(b2)) => b1 == b2,
+            (DaysDelta::Forwards(lhs), DaysDelta::Backwards(rhs))
+            | (DaysDelta::Backwards(lhs), DaysDelta::Forwards(rhs)) => {
+                *lhs == Days(0) && *rhs == Days(0)
+            }
+        }
+    }
+}
+
+impl Eq for DaysDelta {}
+
+impl From<Days> for DaysDelta {
+    fn from(s: Days) -> Self {
+        DaysDelta::Forwards(s)
     }
 }
 
@@ -222,7 +312,8 @@ fn test_date_bounds() {
 
     // let's also check that the entire range do not exceed 2^44 seconds
     // (sometimes used for bounding `Duration` against overflow)
-    let maxsecs = NaiveDate::MAX.signed_duration_since(NaiveDate::MIN).num_seconds();
+    let days = NaiveDate::MAX.days_since(NaiveDate::MIN).forwards().unwrap();
+    let maxsecs = u64::from(days.0) * 24 * 60 * 60;
     let maxsecs = maxsecs + 86401; // also take care of DateTime
     assert!(
         maxsecs < (1 << MAX_BITS),
@@ -635,11 +726,11 @@ impl NaiveDate {
     /// ```
     /// # use chrono::{NaiveDate, Days};
     /// assert_eq!(
-    ///     NaiveDate::from_ymd_opt(2022, 2, 20).unwrap().checked_add_days(Days::new(9)),
+    ///     NaiveDate::from_ymd_opt(2022, 2, 20).unwrap().checked_add_days(Days::from_u32(9)),
     ///     Some(NaiveDate::from_ymd_opt(2022, 3, 1).unwrap())
     /// );
     /// assert_eq!(
-    ///     NaiveDate::from_ymd_opt(2022, 7, 31).unwrap().checked_add_days(Days::new(2)),
+    ///     NaiveDate::from_ymd_opt(2022, 7, 31).unwrap().checked_add_days(Days::from_u32(2)),
     ///     Some(NaiveDate::from_ymd_opt(2022, 8, 2).unwrap())
     /// );
     /// ```
@@ -658,7 +749,7 @@ impl NaiveDate {
     /// ```
     /// # use chrono::{NaiveDate, Days};
     /// assert_eq!(
-    ///     NaiveDate::from_ymd_opt(2022, 2, 20).unwrap().checked_sub_days(Days::new(6)),
+    ///     NaiveDate::from_ymd_opt(2022, 2, 20).unwrap().checked_sub_days(Days::from_u32(6)),
     ///     Some(NaiveDate::from_ymd_opt(2022, 2, 14).unwrap())
     /// );
     /// ```
@@ -1054,6 +1145,19 @@ impl NaiveDate {
         )
     }
 
+    /// Subtracts another `NaiveDate` from the current date.
+    /// Returns a `DaysDelta` of the direction and number of
+    /// days between the two dates.
+    pub fn days_since(self, rhs: NaiveDate) -> DaysDelta {
+        let diff = self.signed_duration_since(rhs).num_days();
+
+        if diff >= 0 {
+            DaysDelta::Forwards(Days::from_u32(diff.try_into().unwrap()))
+        } else {
+            DaysDelta::Backwards(Days::from_u32(diff.abs().try_into().unwrap()))
+        }
+    }
+
     /// Formats the date with the specified formatting items.
     /// Otherwise it is the same as the ordinary `format` method.
     ///
@@ -1159,7 +1263,7 @@ impl NaiveDate {
     /// ```
     #[inline]
     pub fn iter_days(&self) -> NaiveDateDaysIterator {
-        NaiveDateDaysIterator { value: *self }
+        NaiveDateDaysIterator { value: Some(*self) }
     }
 
     /// Returns an iterator that steps by weeks across all representable dates.
@@ -1190,7 +1294,7 @@ impl NaiveDate {
     /// ```
     #[inline]
     pub fn iter_weeks(&self) -> NaiveDateWeeksIterator {
-        NaiveDateWeeksIterator { value: *self }
+        NaiveDateWeeksIterator { value: Some(*self) }
     }
 
     /// Returns the [`NaiveWeek`] that the date belongs to, starting with the [`Weekday`]
@@ -1647,11 +1751,23 @@ impl Add<Days> for NaiveDate {
     }
 }
 
+impl AddAssign<Days> for NaiveDate {
+    fn add_assign(&mut self, days: Days) {
+        *self = self.checked_add_days(days).unwrap();
+    }
+}
+
 impl Sub<Days> for NaiveDate {
     type Output = NaiveDate;
 
     fn sub(self, days: Days) -> Self::Output {
         self.checked_sub_days(days).unwrap()
+    }
+}
+
+impl SubAssign<Days> for NaiveDate {
+    fn sub_assign(&mut self, days: Days) {
+        *self = self.checked_sub_days(days).unwrap();
     }
 }
 
@@ -1730,26 +1846,26 @@ impl Sub<NaiveDate> for NaiveDate {
 /// Iterator over `NaiveDate` with a step size of one day.
 #[derive(Debug, Copy, Clone, Hash, PartialEq, PartialOrd, Eq, Ord)]
 pub struct NaiveDateDaysIterator {
-    value: NaiveDate,
+    value: Option<NaiveDate>,
 }
 
 impl Iterator for NaiveDateDaysIterator {
     type Item = NaiveDate;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.value == NaiveDate::MAX {
-            return None;
-        }
-        // current < NaiveDate::MAX from here on:
         let current = self.value;
-        // This can't panic because current is < NaiveDate::MAX:
-        self.value = current.succ_opt().unwrap();
-        Some(current)
+        self.value = current?.succ_opt();
+        current
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let exact_size = NaiveDate::MAX.signed_duration_since(self.value).num_days();
-        (exact_size as usize, Some(exact_size as usize))
+        match self.value {
+            Some(v) => {
+                let exact_size = NaiveDate::MAX.days_since(v).forwards().unwrap().0;
+                (exact_size as usize, Some(exact_size as usize))
+            }
+            None => (0, Some(0)),
+        }
     }
 }
 
@@ -1757,35 +1873,34 @@ impl ExactSizeIterator for NaiveDateDaysIterator {}
 
 impl DoubleEndedIterator for NaiveDateDaysIterator {
     fn next_back(&mut self) -> Option<Self::Item> {
-        if self.value == NaiveDate::MIN {
-            return None;
-        }
         let current = self.value;
-        self.value = current.pred_opt().unwrap();
-        Some(current)
+        self.value = current?.pred_opt();
+        current
     }
 }
 
 #[derive(Debug, Copy, Clone, Hash, PartialEq, PartialOrd, Eq, Ord)]
 pub struct NaiveDateWeeksIterator {
-    value: NaiveDate,
+    value: Option<NaiveDate>,
 }
 
 impl Iterator for NaiveDateWeeksIterator {
     type Item = NaiveDate;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if NaiveDate::MAX - self.value < OldDuration::weeks(1) {
-            return None;
-        }
         let current = self.value;
-        self.value = current + OldDuration::weeks(1);
-        Some(current)
+        self.value = current?.checked_add_days(Days::from_u32(7));
+        current
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let exact_size = NaiveDate::MAX.signed_duration_since(self.value).num_weeks();
-        (exact_size as usize, Some(exact_size as usize))
+        match self.value {
+            Some(v) => {
+                let exact_size = NaiveDate::MAX.days_since(v).forwards().unwrap().0 / 7;
+                (exact_size as usize, Some(exact_size as usize))
+            }
+            None => (0, Some(0)),
+        }
     }
 }
 
@@ -1793,12 +1908,10 @@ impl ExactSizeIterator for NaiveDateWeeksIterator {}
 
 impl DoubleEndedIterator for NaiveDateWeeksIterator {
     fn next_back(&mut self) -> Option<Self::Item> {
-        if self.value - NaiveDate::MIN < OldDuration::weeks(1) {
-            return None;
-        }
+        // NaiveDate::MAX.days_since(self.value?).forwards()?;
         let current = self.value;
-        self.value = current - OldDuration::weeks(1);
-        Some(current)
+        self.value = current?.checked_sub_days(Days::from_u32(7));
+        current
     }
 }
 
@@ -2625,22 +2738,22 @@ mod tests {
             assert_eq!(lhs.checked_add_days(rhs), sum);
         }
 
-        check((2014, 1, 1), Days::new(0), Some((2014, 1, 1)));
+        check((2014, 1, 1), Days::from_u32(0), Some((2014, 1, 1)));
         // always round towards zero
-        check((2014, 1, 1), Days::new(1), Some((2014, 1, 2)));
-        check((2014, 1, 1), Days::new(364), Some((2014, 12, 31)));
-        check((2014, 1, 1), Days::new(365 * 4 + 1), Some((2018, 1, 1)));
-        check((2014, 1, 1), Days::new(365 * 400 + 97), Some((2414, 1, 1)));
+        check((2014, 1, 1), Days::from_u32(1), Some((2014, 1, 2)));
+        check((2014, 1, 1), Days::from_u32(364), Some((2014, 12, 31)));
+        check((2014, 1, 1), Days::from_u32(365 * 4 + 1), Some((2018, 1, 1)));
+        check((2014, 1, 1), Days::from_u32(365 * 400 + 97), Some((2414, 1, 1)));
 
-        check((-7, 1, 1), Days::new(365 * 12 + 3), Some((5, 1, 1)));
+        check((-7, 1, 1), Days::from_u32(365 * 12 + 3), Some((5, 1, 1)));
 
         // overflow check
         check(
             (0, 1, 1),
-            Days::new(MAX_DAYS_FROM_YEAR_0.try_into().unwrap()),
+            Days::from_u32(MAX_DAYS_FROM_YEAR_0.try_into().unwrap()),
             Some((MAX_YEAR, 12, 31)),
         );
-        check((0, 1, 1), Days::new(u64::try_from(MAX_DAYS_FROM_YEAR_0).unwrap() + 1), None);
+        check((0, 1, 1), Days::from_u32(u32::try_from(MAX_DAYS_FROM_YEAR_0).unwrap() + 1), None);
     }
 
     #[test]
@@ -2651,15 +2764,23 @@ mod tests {
             assert_eq!(lhs - diff, rhs);
         }
 
-        check((2014, 1, 1), (2014, 1, 1), Days::new(0));
-        check((2014, 1, 2), (2014, 1, 1), Days::new(1));
-        check((2014, 12, 31), (2014, 1, 1), Days::new(364));
-        check((2015, 1, 3), (2014, 1, 1), Days::new(365 + 2));
-        check((2018, 1, 1), (2014, 1, 1), Days::new(365 * 4 + 1));
-        check((2414, 1, 1), (2014, 1, 1), Days::new(365 * 400 + 97));
+        check((2014, 1, 1), (2014, 1, 1), Days::from_u32(0));
+        check((2014, 1, 2), (2014, 1, 1), Days::from_u32(1));
+        check((2014, 12, 31), (2014, 1, 1), Days::from_u32(364));
+        check((2015, 1, 3), (2014, 1, 1), Days::from_u32(365 + 2));
+        check((2018, 1, 1), (2014, 1, 1), Days::from_u32(365 * 4 + 1));
+        check((2414, 1, 1), (2014, 1, 1), Days::from_u32(365 * 400 + 97));
 
-        check((MAX_YEAR, 12, 31), (0, 1, 1), Days::new(MAX_DAYS_FROM_YEAR_0.try_into().unwrap()));
-        check((0, 1, 1), (MIN_YEAR, 1, 1), Days::new((-MIN_DAYS_FROM_YEAR_0).try_into().unwrap()));
+        check(
+            (MAX_YEAR, 12, 31),
+            (0, 1, 1),
+            Days::from_u32(MAX_DAYS_FROM_YEAR_0.try_into().unwrap()),
+        );
+        check(
+            (0, 1, 1),
+            (MIN_YEAR, 1, 1),
+            Days::from_u32((-MIN_DAYS_FROM_YEAR_0).try_into().unwrap()),
+        );
     }
 
     #[test]
@@ -2679,6 +2800,26 @@ mod tests {
         date -= Duration::days(10);
         assert_eq!(date, ymd(2016, 10, 1));
         date -= Duration::days(2);
+        assert_eq!(date, ymd(2016, 9, 29));
+    }
+
+    #[test]
+    fn test_days_addassignment() {
+        let ymd = |y, m, d| NaiveDate::from_ymd_opt(y, m, d).unwrap();
+        let mut date = ymd(2016, 10, 1);
+        date += Days::from_u32(10);
+        assert_eq!(date, ymd(2016, 10, 11));
+        date += Days::from_u32(30);
+        assert_eq!(date, ymd(2016, 11, 10));
+    }
+
+    #[test]
+    fn test_days_subassignment() {
+        let ymd = |y, m, d| NaiveDate::from_ymd_opt(y, m, d).unwrap();
+        let mut date = ymd(2016, 10, 11);
+        date -= Days::from_u32(10);
+        assert_eq!(date, ymd(2016, 10, 1));
+        date -= Days::from_u32(2);
         assert_eq!(date, ymd(2016, 9, 29));
     }
 
@@ -2819,10 +2960,10 @@ mod tests {
 
     #[test]
     fn test_day_iterator_limit() {
-        assert_eq!(NaiveDate::from_ymd_opt(262143, 12, 29).unwrap().iter_days().take(4).count(), 2);
+        assert_eq!(NaiveDate::from_ymd_opt(262143, 12, 29).unwrap().iter_days().take(4).count(), 3);
         assert_eq!(
             NaiveDate::from_ymd_opt(-262144, 1, 3).unwrap().iter_days().rev().take(4).count(),
-            2
+            3
         );
     }
 
@@ -2830,11 +2971,11 @@ mod tests {
     fn test_week_iterator_limit() {
         assert_eq!(
             NaiveDate::from_ymd_opt(262143, 12, 12).unwrap().iter_weeks().take(4).count(),
-            2
+            3
         );
         assert_eq!(
             NaiveDate::from_ymd_opt(-262144, 1, 15).unwrap().iter_weeks().rev().take(4).count(),
-            2
+            3
         );
     }
 
